@@ -1,5 +1,10 @@
 # PowerTrader_AI
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
+For Binance Spot setup and migration steps, see EXCHANGE_MIGRATION.md.
+You can place all config in `.env` and just run `python pt_hub.py`.
+Testnet still needs keys; use `BINANCE_PAPER=true` to simulate trades without keys.
+Use `BINANCE_PAPER_TEST=true` to force a full paper trade cycle (entry/hold/dca/exit).
+
 
 “It’s an instance-based (kNN/kernel-style) predictor with online per-instance reliability weighting, used as a multi-timeframe trading signal.” - ChatGPT on the type of AI used in this trading bot.
 
@@ -114,6 +119,7 @@ PowerTrader AI uses a simple folder style:
 ## Step 6 — Train (inside the Hub)
 
 Training builds the system’s coin “memory” so it can generate signals.
+Optional: set `TRAIN_FAST=true` or `TRAIN_LOOKBACK=20000` in `.env` to speed up training.
 
 1. In the Hub, click **Train All**.
 2. Wait until training finishes.

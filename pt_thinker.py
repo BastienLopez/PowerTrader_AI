@@ -17,8 +17,13 @@ import psutil
 import logging
 import json
 import uuid
+from typing import Optional
+from env_loader import load_env
+
+load_env()
 
 from nacl.signing import SigningKey
+from exchanges.binance_client import BinanceExchangeClient
 
 # -----------------------------
 # Robinhood market-data (current ASK), same source as rhcb.py trader:
@@ -26,8 +31,10 @@ from nacl.signing import SigningKey
 #   use result["ask_inclusive_of_buy_spread"]
 # -----------------------------
 ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
+EXCHANGE_PROVIDER = (os.environ.get("EXCHANGE_PROVIDER") or "robinhood").strip().lower()
 
 _RH_MD = None  # lazy-init so import doesn't explode if creds missing
+_EXCHANGE_MD = None
 
 
 class RobinhoodMarketData:
@@ -114,6 +121,50 @@ def robinhood_current_ask(symbol: str) -> float:
         _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
 
     return _RH_MD.get_current_ask(symbol)
+
+
+class ExchangeMarketData:
+    def __init__(self, provider: Optional[str] = None):
+        self.provider = (provider or EXCHANGE_PROVIDER or "robinhood").strip().lower()
+        self._client = None
+
+        if self.provider == "binance":
+            try:
+                self._client = BinanceExchangeClient()
+            except ValueError:
+                self._client = BinanceExchangeClient(public_only=True)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            key_path = os.path.join(base_dir, "r_key.txt")
+            secret_path = os.path.join(base_dir, "r_secret.txt")
+
+            if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
+                raise RuntimeError(
+                    "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
+                    "Run pt_trader.py once to create them (and to set your Robinhood API key)."
+                )
+
+            with open(key_path, "r", encoding="utf-8") as f:
+                api_key = f.read()
+            with open(secret_path, "r", encoding="utf-8") as f:
+                priv_b64 = f.read()
+
+            self._client = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
+
+    def get_current_ask(self, symbol: str) -> float:
+        if self.provider == "binance":
+            return float(self._client.get_price(symbol))
+        return float(self._client.get_current_ask(symbol))
+
+
+def current_ask(symbol: str) -> float:
+    """
+    Exchange-agnostic current ask. Uses Robinhood by default, Binance when EXCHANGE_PROVIDER=binance.
+    """
+    global _EXCHANGE_MD
+    if _EXCHANGE_MD is None:
+        _EXCHANGE_MD = ExchangeMarketData()
+    return _EXCHANGE_MD.get_current_ask(symbol)
 
 
 def restart_program():
@@ -734,7 +785,7 @@ def step_coin(sym: str):
 		rh_symbol = f"{sym}-USD"
 		while True:
 			try:
-				current = robinhood_current_ask(rh_symbol)
+				current = current_ask(rh_symbol)
 				break
 			except Exception:
 				time.sleep(1)

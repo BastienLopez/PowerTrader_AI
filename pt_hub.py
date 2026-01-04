@@ -20,6 +20,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import blended_transform_factory
+from env_loader import load_env
+
+load_env()
 
 DARK_BG = "#070B10"
 DARK_BG2 = "#0B1220"
@@ -2161,6 +2164,9 @@ class PowerTraderHub(tk.Tk):
 
         self.lbl_last_status = ttk.Label(controls_left, text="Last status: N/A")
         self.lbl_last_status.pack(anchor="w", padx=6, pady=(0, 2))
+        self.lbl_trade_mode = ttk.Label(controls_left, text="Trade mode: N/A")
+        self.lbl_trade_mode.pack(anchor="w", padx=6, pady=(0, 6))
+        self._set_trade_mode_label()
 
 
         # ----------------------------
@@ -2204,6 +2210,14 @@ class PowerTraderHub(tk.Tk):
             command=self.toggle_all_scripts,
         )
         self.btn_toggle_all.pack(side="left")
+        self.paper_mode_var = tk.BooleanVar(value=self._env_flag("BINANCE_PAPER", False))
+        self.chk_paper_mode = ttk.Checkbutton(
+            start_all_row,
+            text="Paper mode",
+            variable=self.paper_mode_var,
+            command=self._on_paper_toggle,
+        )
+        self.chk_paper_mode.pack(side="left", padx=(8, 0))
 
 
         # Account info (LEFT column, under status)
@@ -2983,6 +2997,97 @@ class PowerTraderHub(tk.Tk):
         finally:
             q.put(f"{prefix}[process exited]")
 
+    @staticmethod
+    def _env_flag(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name, None)
+        if raw is None:
+            return default
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _set_trade_mode_label(self) -> None:
+        label = getattr(self, "lbl_trade_mode", None)
+        if not label:
+            return
+        mode = getattr(self, "_selected_trade_mode", None)
+        if not mode:
+            if self._env_flag("BINANCE_PAPER", False):
+                mode = "paper"
+            elif self._env_flag("BINANCE_TESTNET", False):
+                mode = "testnet"
+            else:
+                mode = "live"
+        label.config(text=f"Trade mode: {mode}")
+
+    def _on_paper_toggle(self) -> None:
+        try:
+            enabled = bool(self.paper_mode_var.get())
+        except Exception:
+            enabled = False
+        os.environ["BINANCE_PAPER"] = "true" if enabled else "false"
+        if enabled:
+            os.environ["BINANCE_TESTNET"] = "true"
+            self._selected_trade_mode = "paper"
+        self._set_trade_mode_label()
+
+    def _binance_keys_present(self) -> bool:
+        key = (os.environ.get("BINANCE_API_KEY") or "").strip()
+        secret = (os.environ.get("BINANCE_API_SECRET") or "").strip()
+        if not key or not secret:
+            return False
+        placeholders = {"your_key_here", "your_secret_here", "changeme"}
+        if key.lower() in placeholders or secret.lower() in placeholders:
+            return False
+        return True
+
+    def _ensure_binance_trade_mode(self) -> bool:
+        provider = (os.environ.get("EXCHANGE_PROVIDER") or "robinhood").strip().lower()
+        if provider != "binance":
+            return True
+
+        if getattr(self, "paper_mode_var", None) is not None:
+            if bool(self.paper_mode_var.get()):
+                os.environ["BINANCE_PAPER"] = "true"
+        if self._env_flag("BINANCE_PAPER", False):
+            self._selected_trade_mode = "paper"
+            self._set_trade_mode_label()
+            return True
+
+        if not self._binance_keys_present():
+            resp = messagebox.askyesnocancel(
+                "Binance keys missing",
+                "BINANCE_API_KEY and BINANCE_API_SECRET are missing.\n\n"
+                "Yes = Start PAPER trading (no real orders)\n"
+                "No = Cancel",
+            )
+            if resp is None or resp is False:
+                return False
+            os.environ["BINANCE_PAPER"] = "true"
+            self._selected_trade_mode = "paper"
+            try:
+                self.paper_mode_var.set(True)
+            except Exception:
+                pass
+            self._set_trade_mode_label()
+            return True
+
+        resp = messagebox.askyesnocancel(
+            "Binance trade mode",
+            "Start Trader in TESTNET mode?\n\nYes = Testnet\nNo = Live (real funds)\nCancel = Abort",
+        )
+        if resp is None:
+            return False
+
+        use_testnet = bool(resp)
+        os.environ["BINANCE_TESTNET"] = "true" if use_testnet else "false"
+        os.environ["BINANCE_PAPER"] = "false"
+        self._selected_trade_mode = "testnet" if use_testnet else "live"
+        try:
+            self.paper_mode_var.set(False)
+        except Exception:
+            pass
+        self._set_trade_mode_label()
+        return True
+
     def _start_process(self, p: ProcInfo, log_q: Optional["queue.Queue[str]"] = None, prefix: str = "") -> None:
         if p.proc and p.proc.poll() is None:
             return
@@ -3030,6 +3135,9 @@ class PowerTraderHub(tk.Tk):
 
 
     def start_trader(self) -> None:
+        if not self._ensure_binance_trade_mode():
+            self._auto_start_trader_pending = False
+            return
         self._start_process(self.proc_trader, log_q=self.trader_log_q, prefix="[TRADER] ")
 
 
@@ -3138,12 +3246,26 @@ class PowerTraderHub(tk.Tk):
 
     def _running_trainers(self) -> List[str]:
         running: List[str] = []
+        to_remove: List[str] = []
 
         # Trainers launched by this GUI instance
         for c, lp in self.trainers.items():
             try:
                 if lp.info.proc and lp.info.proc.poll() is None:
+                    if self._trainer_marked_finished(c):
+                        try:
+                            lp.info.proc.terminate()
+                        except Exception:
+                            pass
+                        to_remove.append(c)
+                        continue
                     running.append(c)
+            except Exception:
+                pass
+
+        for c in to_remove:
+            try:
+                self.trainers.pop(c, None)
             except Exception:
                 pass
 
@@ -3181,6 +3303,20 @@ class PowerTraderHub(tk.Tk):
                 seen.add(cc)
                 out.append(cc)
         return out
+
+    def _trainer_marked_finished(self, coin: str) -> bool:
+        coin = (coin or "").strip().upper()
+        folder = self.coin_folders.get(coin, "")
+        if not folder or not os.path.isdir(folder):
+            return False
+        try:
+            st = _safe_read_json(os.path.join(folder, "trainer_status.json"))
+            if isinstance(st, dict) and str(st.get("state", "")).upper() == "FINISHED":
+                stamp_path = os.path.join(folder, "trainer_last_training_time.txt")
+                return os.path.isfile(stamp_path)
+        except Exception:
+            return False
+        return False
 
 
 
@@ -3575,7 +3711,11 @@ class PowerTraderHub(tk.Tk):
 
         data = _safe_read_json(self.trader_status_path)
         if not data:
-            self.lbl_last_status.config(text="Last status: N/A (no trader_status.json yet)")
+            trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
+            if trader_running:
+                self.lbl_last_status.config(text="Last status: N/A (waiting for trader_status.json)")
+            else:
+                self.lbl_last_status.config(text="Last status: N/A (trader not started)")
 
             # account summary (right-side status area)
             try:

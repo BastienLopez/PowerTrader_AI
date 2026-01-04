@@ -13,6 +13,10 @@ from colorama import Fore, Style
 import traceback
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
+from exchanges.binance_client import BinanceExchangeClient, BinanceAPIError, BinancePaperExchangeClient
+from env_loader import load_env
+
+load_env()
 
 # -----------------------------
 # GUI HUB OUTPUTS
@@ -152,36 +156,77 @@ def _refresh_paths_and_symbols():
 
 
 #API STUFF
+EXCHANGE_PROVIDER = (os.environ.get("EXCHANGE_PROVIDER") or "robinhood").strip().lower()
 API_KEY = ""
 BASE64_PRIVATE_KEY = ""
 
-try:
-    with open('r_key.txt', 'r', encoding='utf-8') as f:
-        API_KEY = (f.read() or "").strip()
-    with open('r_secret.txt', 'r', encoding='utf-8') as f:
-        BASE64_PRIVATE_KEY = (f.read() or "").strip()
-except Exception:
-    API_KEY = ""
-    BASE64_PRIVATE_KEY = ""
+if EXCHANGE_PROVIDER == "robinhood":
+    try:
+        with open("r_key.txt", "r", encoding="utf-8") as f:
+            API_KEY = (f.read() or "").strip()
+        with open("r_secret.txt", "r", encoding="utf-8") as f:
+            BASE64_PRIVATE_KEY = (f.read() or "").strip()
+    except Exception:
+        API_KEY = ""
+        BASE64_PRIVATE_KEY = ""
 
-if not API_KEY or not BASE64_PRIVATE_KEY:
-    print(
-        "\n[PowerTrader] Robinhood API credentials not found.\n"
-        "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
-        "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
-        "and will save r_key.txt + r_secret.txt so this trader can authenticate.\n"
-    )
-    raise SystemExit(1)
+    if not API_KEY or not BASE64_PRIVATE_KEY:
+        print(
+            "\n[PowerTrader] Robinhood API credentials not found.\n"
+            "Open the GUI and go to Settings -> Robinhood API -> Setup / Update.\n"
+            "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
+            "and will save r_key.txt + r_secret.txt so this trader can authenticate.\n"
+        )
+        raise SystemExit(1)
 
 class CryptoAPITrading:
+    @staticmethod
+    def _binance_keys_present() -> bool:
+        key = (os.environ.get("BINANCE_API_KEY") or "").strip()
+        secret = (os.environ.get("BINANCE_API_SECRET") or "").strip()
+        if not key or not secret:
+            return False
+        placeholders = {"your_key_here", "your_secret_here", "changeme"}
+        if key.lower() in placeholders or secret.lower() in placeholders:
+            return False
+        return True
+
+    @staticmethod
+    def _env_flag(name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name, None)
+        if raw is None:
+            return default
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
     def __init__(self):
         # keep a copy of the folder map (same idea as trader.py)
         self.path_map = dict(base_paths)
 
-        self.api_key = API_KEY
-        private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
-        self.private_key = SigningKey(private_key_seed)
-        self.base_url = "https://trading.robinhood.com"
+        self.exchange_provider = EXCHANGE_PROVIDER
+        self.exchange = None
+
+        if self.exchange_provider == "binance":
+            use_paper = self._env_flag("BINANCE_PAPER", False)
+            keys_present = self._binance_keys_present()
+            if not keys_present and self._env_flag("BINANCE_TESTNET", False):
+                use_paper = True
+
+            if use_paper:
+                self.exchange = BinancePaperExchangeClient()
+            else:
+                try:
+                    self.exchange = BinanceExchangeClient()
+                except ValueError as e:
+                    print(f"\n[PowerTrader] Binance API credentials not found.\n{e}\n")
+                    raise SystemExit(1)
+            self.api_key = ""
+            self.private_key = None
+            self.base_url = ""
+        else:
+            self.api_key = API_KEY
+            private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
+            self.private_key = SigningKey(private_key_seed)
+            self.base_url = "https://trading.robinhood.com"
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = [-2.5, -5.0, -10.0, -20.0, -30.0, -40.0, -50.0]  # Moved to instance variable
@@ -217,6 +262,21 @@ class CryptoAPITrading:
         self._dca_buy_ts = {}         # { "BTC": [ts, ts, ...] } (DCA buys only)
         self._dca_last_sell_ts = {}   # { "BTC": ts_of_last_sell }
         self._seed_dca_window_from_history()
+
+        # --- Paper test mode (forced entry/exit cycle) ---
+        try:
+            self.paper_test_mode = self._env_flag("BINANCE_PAPER_TEST", False)
+            self.paper_test_hold_seconds = int(os.environ.get("BINANCE_PAPER_TEST_HOLD_SECONDS", "120"))
+            self.paper_test_dca_seconds = int(os.environ.get("BINANCE_PAPER_TEST_DCA_SECONDS", "60"))
+            self.paper_test_alloc_usd = float(os.environ.get("BINANCE_PAPER_TEST_ALLOC_USD", "50"))
+            self.paper_test_coin = (os.environ.get("BINANCE_PAPER_TEST_COIN") or "").strip().upper()
+        except Exception:
+            self.paper_test_mode = False
+            self.paper_test_hold_seconds = 120
+            self.paper_test_dca_seconds = 60
+            self.paper_test_alloc_usd = 50.0
+            self.paper_test_coin = ""
+        self._paper_test_state = {}
 
 
 
@@ -617,8 +677,102 @@ class CryptoAPITrading:
             self._dca_last_sell_ts[base] = float(ts if ts is not None else time.time())
         self._dca_buy_ts[base] = []
 
+    def _paper_test_tick(
+        self,
+        holdings_list: list,
+        buying_power: float,
+        current_buy_prices: Dict[str, float],
+        current_sell_prices: Dict[str, float],
+    ) -> bool:
+        traded = False
+        if not (self.paper_test_mode and self.exchange_provider == "binance"):
+            return False
+        if not isinstance(self.exchange, BinancePaperExchangeClient):
+            return False
+
+        target = self.paper_test_coin or (crypto_symbols[0] if crypto_symbols else "")
+        target = str(target).upper().strip()
+        if not target:
+            return False
+
+        full_symbol = f"{target}-USD"
+        price = float(current_buy_prices.get(full_symbol, 0.0) or 0.0)
+        if price <= 0.0:
+            return False
+
+        holding = None
+        for h in holdings_list:
+            if str(h.get("asset_code", "")).upper().strip() == target:
+                holding = h
+                break
+
+        state = self._paper_test_state.setdefault(
+            target, {"stage": "idle", "buy_ts": None, "dca_done": False}
+        )
+        now = time.time()
+
+        if not holding or float(holding.get("total_quantity", 0.0) or 0.0) <= 0.0:
+            if state.get("stage") != "buying":
+                alloc = min(float(buying_power or 0.0), float(self.paper_test_alloc_usd))
+                if alloc <= 0.0:
+                    return False
+                resp = self.place_buy_order(
+                    str(uuid.uuid4()),
+                    "buy",
+                    "market",
+                    full_symbol,
+                    alloc,
+                    tag="PAPER_TEST_ENTRY",
+                )
+                if resp and "errors" not in resp:
+                    state["stage"] = "holding"
+                    state["buy_ts"] = now
+                    state["dca_done"] = False
+                    traded = True
+            return traded
+
+        buy_ts = float(state.get("buy_ts") or now)
+        held_for = now - buy_ts
+
+        if (not state.get("dca_done")) and (held_for >= float(self.paper_test_dca_seconds)):
+            alloc = min(float(buying_power or 0.0), float(self.paper_test_alloc_usd) * 0.5)
+            if alloc > 0.0:
+                resp = self.place_buy_order(
+                    str(uuid.uuid4()),
+                    "buy",
+                    "market",
+                    full_symbol,
+                    alloc,
+                    tag="PAPER_TEST_DCA",
+                )
+                if resp and "errors" not in resp:
+                    state["dca_done"] = True
+                    traded = True
+
+        if held_for >= float(self.paper_test_hold_seconds):
+            qty = float(holding.get("total_quantity", 0.0) or 0.0)
+            sell_price = float(current_sell_prices.get(full_symbol, price) or price)
+            if qty > 0.0:
+                resp = self.place_sell_order(
+                    str(uuid.uuid4()),
+                    "sell",
+                    "market",
+                    full_symbol,
+                    qty,
+                    expected_price=sell_price,
+                    tag="PAPER_TEST_EXIT",
+                )
+                if resp and "errors" not in resp:
+                    state["stage"] = "idle"
+                    state["buy_ts"] = None
+                    state["dca_done"] = False
+                    traded = True
+        return traded
+
 
     def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
+        if self.exchange_provider != "robinhood":
+            raise RuntimeError("Robinhood API request attempted while EXCHANGE_PROVIDER=binance.")
 
         timestamp = self._get_current_timestamp()
         headers = self.get_authorization_header(method, path, body, timestamp)
@@ -645,6 +799,8 @@ class CryptoAPITrading:
     def get_authorization_header(
             self, method: str, path: str, body: str, timestamp: int
     ) -> Dict[str, str]:
+        if self.exchange_provider != "robinhood":
+            raise RuntimeError("Robinhood authorization requested while EXCHANGE_PROVIDER=binance.")
         message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
         signed = self.private_key.sign(message_to_sign.encode("utf-8"))
 
@@ -654,15 +810,99 @@ class CryptoAPITrading:
             "x-timestamp": str(timestamp),
         }
 
+    def _binance_account(self) -> Dict[str, Any]:
+        if not self.exchange:
+            return {}
+        try:
+            balances = self.exchange.get_balances()
+            quote = getattr(self.exchange, "default_quote", "USDT")
+            buying_power = float(balances.get(quote, {}).get("free", 0.0))
+            return {"buying_power": buying_power, "balances": balances}
+        except BinanceAPIError:
+            return {}
+
+    def _binance_holdings(self) -> Dict[str, Any]:
+        if not self.exchange:
+            return {"results": []}
+        try:
+            balances = self.exchange.get_balances()
+            quote = getattr(self.exchange, "default_quote", "USDT")
+            results = []
+            for asset, info in balances.items():
+                if asset == quote:
+                    continue
+                total = float(info.get("total", 0.0))
+                if total > 0.0:
+                    results.append({"asset_code": asset, "total_quantity": total})
+            return {"results": results}
+        except BinanceAPIError:
+            return {"results": []}
+
+    def _binance_orders(self, symbol: str) -> Dict[str, Any]:
+        if not self.exchange:
+            return {"results": []}
+        try:
+            orders = self.exchange.get_order_history(symbol, limit=1000)
+        except BinanceAPIError:
+            return {"results": []}
+
+        results = []
+        for order in orders or []:
+            side = str(order.get("side", "")).lower()
+            status = str(order.get("status", "")).upper()
+            if status == "FILLED":
+                state = "filled"
+            elif status in {"CANCELED", "REJECTED", "EXPIRED"}:
+                state = "canceled"
+            else:
+                state = "open"
+
+            ts_ms = order.get("time", None)
+            created_at = ""
+            try:
+                created_at = datetime.datetime.utcfromtimestamp(int(ts_ms) / 1000).isoformat() + "Z"
+            except Exception:
+                created_at = ""
+
+            executions = []
+            try:
+                exec_qty = float(order.get("executedQty", 0.0))
+                exec_quote = float(order.get("cummulativeQuoteQty", 0.0))
+                if exec_qty > 0:
+                    executions.append(
+                        {
+                            "quantity": str(exec_qty),
+                            "effective_price": str(exec_quote / exec_qty),
+                        }
+                    )
+            except Exception:
+                pass
+
+            results.append(
+                {
+                    "side": side,
+                    "state": state,
+                    "created_at": created_at,
+                    "executions": executions,
+                }
+            )
+        return {"results": results}
+
     def get_account(self) -> Any:
+        if self.exchange_provider == "binance":
+            return self._binance_account()
         path = "/api/v1/crypto/trading/accounts/"
         return self.make_api_request("GET", path)
 
     def get_holdings(self) -> Any:
+        if self.exchange_provider == "binance":
+            return self._binance_holdings()
         path = "/api/v1/crypto/trading/holdings/"
         return self.make_api_request("GET", path)
 
     def get_trading_pairs(self) -> Any:
+        if self.exchange_provider == "binance":
+            return [{"symbol": f"{sym}-{getattr(self.exchange, 'default_quote', 'USDT')}"} for sym in crypto_symbols]
         path = "/api/v1/crypto/trading/trading_pairs/"
         response = self.make_api_request("GET", path)
 
@@ -676,6 +916,8 @@ class CryptoAPITrading:
         return trading_pairs
 
     def get_orders(self, symbol: str) -> Any:
+        if self.exchange_provider == "binance":
+            return self._binance_orders(symbol)
         path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
         return self.make_api_request("GET", path)
 
@@ -738,6 +980,39 @@ class CryptoAPITrading:
         sell_prices = {}
         valid_symbols = []
 
+        if self.exchange_provider == "binance":
+            for symbol in symbols:
+                if symbol == "USDC-USD":
+                    continue
+                try:
+                    price = float(self.exchange.get_price(symbol))
+                    if price > 0.0:
+                        buy_prices[symbol] = price
+                        sell_prices[symbol] = price
+                        valid_symbols.append(symbol)
+                        try:
+                            self._last_good_bid_ask[symbol] = {"ask": price, "bid": price, "ts": time.time()}
+                        except Exception:
+                            pass
+                        continue
+                except Exception:
+                    pass
+
+                cached = None
+                try:
+                    cached = self._last_good_bid_ask.get(symbol)
+                except Exception:
+                    cached = None
+
+                if cached:
+                    ask = float(cached.get("ask", 0.0) or 0.0)
+                    bid = float(cached.get("bid", 0.0) or 0.0)
+                    if ask > 0.0 and bid > 0.0:
+                        buy_prices[symbol] = ask
+                        sell_prices[symbol] = bid
+                        valid_symbols.append(symbol)
+            return buy_prices, sell_prices, valid_symbols
+
         for symbol in symbols:
             if symbol == "USDC-USD":
                 continue
@@ -789,6 +1064,35 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        if self.exchange_provider == "binance":
+            try:
+                current_buy_prices, _, _ = self.get_price([symbol])
+                current_price = float(current_buy_prices.get(symbol, 0.0) or 0.0)
+                if current_price <= 0.0 or not self.exchange:
+                    return None
+
+                asset_quantity = amount_in_usd / current_price
+                response = self.exchange.create_order(
+                    symbol=symbol,
+                    side="BUY",
+                    type=order_type.upper(),
+                    quantity=asset_quantity,
+                )
+                order_id = response.get("orderId") or response.get("clientOrderId")
+                self._record_trade(
+                    side="buy",
+                    symbol=symbol,
+                    qty=float(asset_quantity),
+                    price=float(current_price),
+                    avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+                    pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                    tag=tag,
+                    order_id=order_id,
+                )
+                return response
+            except Exception as e:
+                return {"errors": [{"detail": str(e)}]}
+
         # Fetch the current price of the asset
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
         current_price = current_buy_prices[symbol]
@@ -866,6 +1170,31 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        if self.exchange_provider == "binance":
+            try:
+                if not self.exchange:
+                    return None
+                response = self.exchange.create_order(
+                    symbol=symbol,
+                    side="SELL",
+                    type=order_type.upper(),
+                    quantity=asset_quantity,
+                )
+                order_id = response.get("orderId") or response.get("clientOrderId")
+                self._record_trade(
+                    side="sell",
+                    symbol=symbol,
+                    qty=float(asset_quantity),
+                    price=float(expected_price) if expected_price is not None else None,
+                    avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+                    pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+                    tag=tag,
+                    order_id=order_id,
+                )
+                return response
+            except Exception as e:
+                return {"errors": [{"detail": str(e)}]}
+
         body = {
             "client_order_id": client_order_id,
             "side": side,
@@ -946,6 +1275,28 @@ class CryptoAPITrading:
         except Exception:
             holdings_list = []
             snapshot_ok = False
+
+        # Paper test mode can trigger simulated trades regardless of signals.
+        try:
+            paper_traded = self._paper_test_tick(
+                holdings_list,
+                buying_power,
+                current_buy_prices,
+                current_sell_prices,
+            )
+        except Exception:
+            paper_traded = False
+
+        if paper_traded:
+            trades_made = True
+            # Refresh account/holdings so UI reflects the simulated trade immediately.
+            try:
+                account = self.get_account()
+                holdings = self.get_holdings()
+                buying_power = float(account.get("buying_power", 0))
+                holdings_list = holdings.get("results", []) if isinstance(holdings, dict) else []
+            except Exception:
+                pass
 
         holdings_buy_value = 0.0
         holdings_sell_value = 0.0

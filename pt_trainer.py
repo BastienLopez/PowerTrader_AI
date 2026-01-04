@@ -209,7 +209,21 @@ def PrintException():
 	linecache.checkcache(filename)
 	line = linecache.getline(filename, lineno, f.f_globals)
 	print ('EXCEPTION IN (LINE {} "{}"): {}'.format(lineno, line.strip(), exc_obj))
-how_far_to_look_back = 100000
+def _env_int(name: str, default: int) -> int:
+	try:
+		return int(os.environ.get(name, default))
+	except Exception:
+		return default
+
+def _env_flag(name: str, default: bool = False) -> bool:
+	raw = os.environ.get(name, None)
+	if raw is None:
+		return default
+	return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+how_far_to_look_back = _env_int("TRAIN_LOOKBACK", 100000)
+if _env_flag("TRAIN_FAST", False) and "TRAIN_LOOKBACK" not in os.environ:
+	how_far_to_look_back = 20000
 number_of_candles = [2]
 number_of_candles_index = 0
 def restart_program():
@@ -1474,14 +1488,22 @@ while True:
 												except:
 													difference = 100.0
 												try:
-													direction = 'down'
-													try:
-														indy = 0
-														while True:
-															new_memory = 'no'
-															var3 = (moves[indy]*100)
-															high_var3 = (high_moves[indy]*100)
-															low_var3 = (low_moves[indy]*100)
+														direction = 'down'
+														try:
+															indy = 0
+															while True:
+																new_memory = 'no'
+																if (
+																	indy >= len(moves)
+																	or indy >= len(high_moves)
+																	or indy >= len(low_moves)
+																	or indy >= len(high_move_weights)
+																	or indy >= len(low_move_weights)
+																):
+																	break
+																var3 = (moves[indy]*100)
+																high_var3 = (high_moves[indy]*100)
+																low_var3 = (low_moves[indy]*100)
 															if high_perc_diff_now_actual > high_var3+(high_var3*0.1):
 																high_new_weight = high_move_weights[indy] + 0.25
 																if high_new_weight > 2.0:
