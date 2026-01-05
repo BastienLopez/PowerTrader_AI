@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from exchanges.binance_client import BinanceExchangeClient, BinanceAPIError, BinancePaperExchangeClient
 from env_loader import load_env
+import indicators
 
 load_env()
 
@@ -42,11 +43,65 @@ _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 	"gui_settings.json"
 )
 
+_STRATEGY_DEFAULT = {
+	"mode": "selector",
+	"indicators": {
+		"macd": False,
+		"stochastic": False,
+		"momentum": False,
+		"obv": False,
+		"rsi": False,
+		"bollinger": False,
+		"ema": False,
+		"atr": False,
+		"volume_profile": False,
+		"adx": False,
+		"pivots": False,
+		"ichimoku": False,
+	},
+	"check_all": False,
+	"replace_neural": False,
+}
+
 _gui_settings_cache = {
 	"mtime": None,
 	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
 	"main_neural_dir": None,
+	"strategy": dict(_STRATEGY_DEFAULT),
 }
+
+def _normalize_strategy(data: dict) -> dict:
+	out = {
+		"mode": _STRATEGY_DEFAULT["mode"],
+		"indicators": dict(_STRATEGY_DEFAULT["indicators"]),
+		"check_all": _STRATEGY_DEFAULT["check_all"],
+		"replace_neural": _STRATEGY_DEFAULT["replace_neural"],
+	}
+
+	if not isinstance(data, dict):
+		return out
+
+	strat = data.get("strategy", {})
+	if isinstance(strat, dict):
+		mode = str(strat.get("mode", out["mode"])).lower().strip()
+		if mode in ("selector", "super"):
+			out["mode"] = mode
+
+		out["check_all"] = bool(strat.get("check_all", out["check_all"]))
+		out["replace_neural"] = bool(strat.get("replace_neural", out["replace_neural"]))
+
+		ind = strat.get("indicators", {})
+		if isinstance(ind, dict):
+			for k in out["indicators"].keys():
+				if k in ind:
+					out["indicators"][k] = bool(ind.get(k))
+
+	if out["check_all"]:
+		for k in out["indicators"].keys():
+			out["indicators"][k] = True
+		out["mode"] = "super"
+
+	return out
 
 def _load_gui_settings() -> dict:
 	"""
@@ -82,11 +137,13 @@ def _load_gui_settings() -> dict:
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
 		_gui_settings_cache["main_neural_dir"] = main_neural_dir
+		_gui_settings_cache["strategy"] = _normalize_strategy(data)
 
 		return {
 			"mtime": mtime,
 			"coins": list(coins),
 			"main_neural_dir": main_neural_dir,
+			"strategy": dict(_gui_settings_cache["strategy"]),
 		}
 	except Exception:
 		return dict(_gui_settings_cache)
@@ -243,6 +300,8 @@ class CryptoAPITrading:
 
         # GUI hub persistence
         self._pnl_ledger = self._load_pnl_ledger()
+        if not os.path.isfile(PNL_LEDGER_PATH):
+            self._save_pnl_ledger()
 
         # Cache last known bid/ask per symbol so transient API misses don't zero out account value
         self._last_good_bid_ask = {}
@@ -277,6 +336,21 @@ class CryptoAPITrading:
             self.paper_test_alloc_usd = 50.0
             self.paper_test_coin = ""
         self._paper_test_state = {}
+
+        # --- Strategy settings ---
+        self.strategy_super_threshold = 0.6
+
+        # --- Pine signal settings ---
+        self.pine_signal_enabled = self._env_flag("PINE_SIGNAL_ENABLED", False)
+        self.pine_signal_mode = (os.environ.get("PINE_SIGNAL_MODE", "filter") or "filter").strip().lower()
+        if self.pine_signal_mode not in {"filter", "replace", "off"}:
+            self.pine_signal_mode = "filter"
+        self.pine_signal_use_exit = self._env_flag("PINE_SIGNAL_USE_EXIT", False)
+        self.pine_signal_max_age = int(os.environ.get("PINE_SIGNAL_MAX_AGE_SECONDS", "300") or 300)
+        self.pine_signal_file = (os.environ.get("PINE_SIGNAL_FILE") or "").strip()
+        if not self.pine_signal_file and self.pine_signal_enabled:
+            self.pine_signal_file = os.path.join(HUB_DATA_DIR, "pine_signals.jsonl")
+        self._pine_signal_state = {"pos": 0, "signals": {}}
 
 
 
@@ -445,6 +519,279 @@ class CryptoAPITrading:
             return val
         except Exception:
             return 0
+
+    @staticmethod
+    def _normalize_signal_symbol(raw: str) -> str:
+        sym = str(raw or "").strip().upper()
+        if not sym:
+            return ""
+        if "-" in sym:
+            base, _ = sym.split("-", 1)
+            return base
+        if "_" in sym:
+            base, _ = sym.split("_", 1)
+            return base
+        if "/" in sym:
+            base, _ = sym.split("/", 1)
+            return base
+        for quote in ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "BNB"):
+            if sym.endswith(quote) and len(sym) > len(quote):
+                return sym[: -len(quote)]
+        return sym
+
+    def _refresh_pine_signals(self) -> None:
+        if not self.pine_signal_enabled or not self.pine_signal_file:
+            return
+        if not os.path.isfile(self.pine_signal_file):
+            return
+        try:
+            pos = int(self._pine_signal_state.get("pos", 0))
+            with open(self.pine_signal_file, "r", encoding="utf-8") as f:
+                f.seek(pos)
+                for line in f:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        continue
+                    symbol = self._normalize_signal_symbol(payload.get("symbol") or payload.get("ticker") or "")
+                    if not symbol:
+                        continue
+                    action = str(payload.get("action") or payload.get("signal") or "").strip().lower()
+                    if action not in {"buy", "sell", "hold", "stop"}:
+                        continue
+                    ts_val = payload.get("ts") or payload.get("time") or payload.get("timestamp")
+                    try:
+                        ts = float(ts_val)
+                        if ts > 1e12:
+                            ts = ts / 1000.0
+                    except Exception:
+                        ts = time.time()
+                    strength = payload.get("strength")
+                    self._pine_signal_state.setdefault("signals", {})[symbol] = {
+                        "action": action,
+                        "ts": ts,
+                        "strength": strength,
+                    }
+                self._pine_signal_state["pos"] = f.tell()
+        except Exception:
+            pass
+
+    def _get_pine_signal(self, symbol: str) -> Optional[dict]:
+        if not self.pine_signal_enabled or self.pine_signal_mode == "off":
+            return None
+        self._refresh_pine_signals()
+        sym = self._normalize_signal_symbol(symbol)
+        signals = self._pine_signal_state.get("signals", {}) if isinstance(self._pine_signal_state, dict) else {}
+        sig = signals.get(sym)
+        if not isinstance(sig, dict):
+            return None
+        try:
+            ts = float(sig.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        if self.pine_signal_max_age > 0 and ts > 0:
+            if (time.time() - ts) > float(self.pine_signal_max_age):
+                return None
+        return dict(sig)
+
+    def _get_strategy_settings(self) -> dict:
+        try:
+            s = _load_gui_settings()
+            strat = s.get("strategy", None)
+            if isinstance(strat, dict):
+                return dict(strat)
+        except Exception:
+            pass
+        return dict(_STRATEGY_DEFAULT)
+
+    def _fetch_strategy_candles(self, symbol: str, limit: int = 120) -> list:
+        if self.exchange_provider != "binance" or not self.exchange:
+            return []
+        settings = _load_gui_settings()
+        tf = str(settings.get("default_timeframe", "1hour")).lower().strip()
+        limit = int(settings.get("candles_limit", limit) or limit)
+        tf_map = {
+            "1min": "1m",
+            "5min": "5m",
+            "15min": "15m",
+            "30min": "30m",
+            "1hour": "1h",
+            "2hour": "2h",
+            "4hour": "4h",
+            "8hour": "8h",
+            "12hour": "12h",
+            "1day": "1d",
+            "1week": "1w",
+        }
+        interval = tf_map.get(tf, "1h")
+        try:
+            return self.exchange.get_klines(symbol, interval=interval, limit=limit)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _extract_series(candles: list) -> dict:
+        closes = []
+        highs = []
+        lows = []
+        volumes = []
+        for c in candles or []:
+            try:
+                closes.append(float(c.get("close", 0.0)))
+                highs.append(float(c.get("high", 0.0)))
+                lows.append(float(c.get("low", 0.0)))
+                volumes.append(float(c.get("volume", 0.0)))
+            except Exception:
+                continue
+        return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+
+    def _indicator_condition_score(self, name: str, series: dict) -> tuple:
+        closes = series["closes"]
+        highs = series["highs"]
+        lows = series["lows"]
+        volumes = series["volumes"]
+        price = closes[-1] if closes else 0.0
+
+        if name == "rsi":
+            val = indicators.rsi(closes)
+            ok = val is not None and val < 30.0
+            return ok, 1.0 if ok else 0.0
+
+        if name == "macd":
+            macd_line, signal_line, _ = indicators.macd(closes)
+            if macd_line is None or signal_line is None or len(closes) < 2:
+                return False, 0.0
+            # detect bullish cross using last two MACD values
+            macd_series = indicators._ema_series(closes, 12)
+            slow_series = indicators._ema_series(closes, 26)
+            if not macd_series or not slow_series:
+                return False, 0.0
+            macd_vals = [f - s for f, s in zip(macd_series[-len(slow_series):], slow_series)]
+            signal_vals = indicators._ema_series(macd_vals, 9)
+            if len(macd_vals) < 2 or len(signal_vals) < 2:
+                return False, 0.0
+            prev_cross = macd_vals[-2] <= signal_vals[-2]
+            now_cross = macd_vals[-1] > signal_vals[-1]
+            ok = prev_cross and now_cross
+            return ok, 1.0 if ok else 0.0
+
+        if name == "stochastic":
+            k, d = indicators.stochastic(highs, lows, closes)
+            if k is None or d is None:
+                return False, 0.0
+            if len(closes) < 2:
+                return False, 0.0
+            # compute previous k/d using series without last close
+            k_prev, d_prev = indicators.stochastic(highs[:-1], lows[:-1], closes[:-1])
+            if k_prev is None or d_prev is None:
+                return False, 0.0
+            ok = (k < 20.0) and (k_prev <= d_prev) and (k > d)
+            return ok, 1.0 if ok else 0.0
+
+        if name == "momentum":
+            val = indicators.momentum(closes)
+            ok = val is not None and val > 0.0
+            return ok, 1.0 if ok else 0.0
+
+        if name == "obv":
+            if len(closes) < 2 or len(volumes) < 2:
+                return False, 0.0
+            obv_now = indicators.obv(closes, volumes)
+            obv_prev = indicators.obv(closes[:-1], volumes[:-1])
+            ok = obv_now is not None and obv_prev is not None and obv_now > obv_prev
+            return ok, 1.0 if ok else 0.0
+
+        if name == "bollinger":
+            upper, mid, lower = indicators.bollinger_bands(closes)
+            ok = lower is not None and price <= lower
+            return ok, 1.0 if ok else 0.0
+
+        if name == "ema":
+            ema_fast = indicators.ema(closes, 8)
+            ema_slow = indicators.ema(closes, 21)
+            if ema_slow is None:
+                return False, 0.0
+            ok = (ema_fast is not None and ema_fast > ema_slow) or (price > ema_slow)
+            return ok, 1.0 if ok else 0.0
+
+        if name == "atr":
+            val = indicators.atr(highs, lows, closes)
+            ok = val is not None
+            return True, 0.5 if ok else 0.0
+
+        if name == "volume_profile":
+            ratio = indicators.volume_profile(volumes)
+            ok = ratio is not None and ratio > 1.0
+            return ok, 1.0 if ok else 0.0
+
+        if name == "adx":
+            val = indicators.adx(highs, lows, closes)
+            ok = val is not None and val > 20.0
+            return ok, 1.0 if ok else 0.0
+
+        if name == "pivots":
+            piv = indicators.pivots(highs, lows, closes)
+            if not piv:
+                return False, 0.0
+            s1 = piv.get("s1", None)
+            if not s1:
+                return False, 0.0
+            ok = (price >= s1 * 0.99) and (price <= s1 * 1.01)
+            return ok, 1.0 if ok else 0.0
+
+        if name == "ichimoku":
+            ichi = indicators.ichimoku(highs, lows)
+            if not ichi:
+                return False, 0.0
+            cloud_top = max(ichi["senkou_a"], ichi["senkou_b"])
+            ok = (price > cloud_top) and (ichi["tenkan"] > ichi["kijun"])
+            return ok, 1.0 if ok else 0.0
+
+        return False, 0.0
+
+    def _strategy_should_enter(self, symbol: str, long_level: int, short_level: int, candles: list) -> tuple:
+        cfg = self._get_strategy_settings()
+        indicators_selected = [k for k, v in (cfg.get("indicators") or {}).items() if v]
+        neural_ok = (long_level >= 3) and (short_level == 0)
+        neural_score = (max(0.0, min(7.0, float(long_level))) / 7.0) if short_level == 0 else 0.0
+
+        if not indicators_selected and not cfg.get("replace_neural", False):
+            return neural_ok, neural_score
+        if not indicators_selected and cfg.get("replace_neural", False):
+            return False, 0.0
+
+        series = self._extract_series(candles)
+        if not series["closes"] or len(series["closes"]) < 30:
+            if cfg.get("replace_neural", False):
+                return False, 0.0
+            return neural_ok, neural_score
+
+        conditions = []
+        scores = []
+        for ind in indicators_selected:
+            ok, score = self._indicator_condition_score(ind, series)
+            conditions.append(ok)
+            scores.append(score)
+
+        mode = str(cfg.get("mode", "selector")).lower().strip()
+        replace_neural = bool(cfg.get("replace_neural", False))
+
+        if mode == "selector":
+            indicators_ok = all(conditions) if conditions else True
+            if replace_neural:
+                return indicators_ok, 1.0 if indicators_ok else 0.0
+            return (neural_ok and indicators_ok), neural_score
+
+        # super mode
+        if not replace_neural:
+            scores.append(neural_score)
+        if not scores:
+            return neural_ok, neural_score
+        score = sum(scores) / float(len(scores))
+        return (score >= float(self.strategy_super_threshold)), score
 
     @staticmethod
     def _read_long_price_levels(symbol: str) -> list:
@@ -752,6 +1099,13 @@ class CryptoAPITrading:
         if held_for >= float(self.paper_test_hold_seconds):
             qty = float(holding.get("total_quantity", 0.0) or 0.0)
             sell_price = float(current_sell_prices.get(full_symbol, price) or price)
+            avg_cost_basis = None
+            try:
+                avg_cost_basis = float(self.cost_basis.get(target, 0.0))
+                if avg_cost_basis <= 0.0:
+                    avg_cost_basis = None
+            except Exception:
+                avg_cost_basis = None
             if qty > 0.0:
                 resp = self.place_sell_order(
                     str(uuid.uuid4()),
@@ -760,6 +1114,7 @@ class CryptoAPITrading:
                     full_symbol,
                     qty,
                     expected_price=sell_price,
+                    avg_cost_basis=avg_cost_basis,
                     tag="PAPER_TEST_EXIT",
                 )
                 if resp and "errors" not in resp:
@@ -850,7 +1205,7 @@ class CryptoAPITrading:
         for order in orders or []:
             side = str(order.get("side", "")).lower()
             status = str(order.get("status", "")).upper()
-            if status == "FILLED":
+            if status in {"FILLED", "PARTIALLY_FILLED"}:
                 state = "filled"
             elif status in {"CANCELED", "REJECTED", "EXPIRED"}:
                 state = "canceled"
@@ -1078,12 +1433,32 @@ class CryptoAPITrading:
                     type=order_type.upper(),
                     quantity=asset_quantity,
                 )
+                fill_price = float(current_price)
+                try:
+                    exec_qty = response.get("executedQty")
+                    if exec_qty is not None:
+                        asset_quantity = float(exec_qty)
+                except Exception:
+                    pass
+                try:
+                    resp_price = float(response.get("price", 0.0) or 0.0)
+                    if resp_price > 0.0:
+                        fill_price = resp_price
+                except Exception:
+                    pass
+                try:
+                    exec_qty = float(response.get("executedQty", 0.0) or 0.0)
+                    exec_quote = float(response.get("cummulativeQuoteQty", 0.0) or 0.0)
+                    if exec_qty > 0.0 and exec_quote > 0.0:
+                        fill_price = exec_quote / exec_qty
+                except Exception:
+                    pass
                 order_id = response.get("orderId") or response.get("clientOrderId")
                 self._record_trade(
                     side="buy",
                     symbol=symbol,
                     qty=float(asset_quantity),
-                    price=float(current_price),
+                    price=float(fill_price),
                     avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
                     pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
                     tag=tag,
@@ -1180,12 +1555,32 @@ class CryptoAPITrading:
                     type=order_type.upper(),
                     quantity=asset_quantity,
                 )
+                fill_price = float(expected_price) if expected_price is not None else None
+                try:
+                    exec_qty = response.get("executedQty")
+                    if exec_qty is not None:
+                        asset_quantity = float(exec_qty)
+                except Exception:
+                    pass
+                try:
+                    resp_price = float(response.get("price", 0.0) or 0.0)
+                    if resp_price > 0.0:
+                        fill_price = resp_price
+                except Exception:
+                    pass
+                try:
+                    exec_qty = float(response.get("executedQty", 0.0) or 0.0)
+                    exec_quote = float(response.get("cummulativeQuoteQty", 0.0) or 0.0)
+                    if exec_qty > 0.0 and exec_quote > 0.0:
+                        fill_price = exec_quote / exec_qty
+                except Exception:
+                    pass
                 order_id = response.get("orderId") or response.get("clientOrderId")
                 self._record_trade(
                     side="sell",
                     symbol=symbol,
                     qty=float(asset_quantity),
-                    price=float(expected_price) if expected_price is not None else None,
+                    price=float(fill_price) if fill_price is not None else None,
                     avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
                     pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
                     tag=tag,
@@ -1499,6 +1894,29 @@ class CryptoAPITrading:
                 "dist_to_trail_pct": float(dist_to_trail_pct) if dist_to_trail_pct else 0.0,
             }
 
+            pine_sig = self._get_pine_signal(symbol)
+            if self.pine_signal_use_exit and pine_sig:
+                action = str(pine_sig.get("action") or "").strip().lower()
+                if action in {"sell", "stop"} and quantity > 0:
+                    response = self.place_sell_order(
+                        str(uuid.uuid4()),
+                        "sell",
+                        "market",
+                        full_symbol,
+                        quantity,
+                        expected_price=current_sell_price,
+                        avg_cost_basis=avg_cost_basis,
+                        pnl_pct=gain_loss_percentage_sell,
+                        tag="PINE_STOP" if action == "stop" else "PINE_SELL",
+                    )
+                    trades_made = True
+                    self.trailing_pm.pop(symbol, None)
+                    self._reset_dca_window_for_trade(symbol, sold=True)
+                    print(f"  Pine signal {action} for {symbol}. Sell response: {response}")
+                    time.sleep(2)
+                    holdings = self.get_holdings()
+                    continue
+
 
             print(
                 f"\nSymbol: {symbol}"
@@ -1748,10 +2166,34 @@ class CryptoAPITrading:
             buy_count = self._read_long_dca_signal(base_symbol)
             sell_count = self._read_short_dca_signal(base_symbol)
 
-            # Default behavior: long must be >= 3 and short must be 0
-            if not (buy_count >= 3 and sell_count == 0):
-                start_index += 1
-                continue
+            pine_sig = self._get_pine_signal(base_symbol)
+            pine_action = ""
+            if pine_sig:
+                pine_action = str(pine_sig.get("action") or "").strip().lower()
+            if self.pine_signal_enabled and self.pine_signal_mode == "replace":
+                if pine_action != "buy":
+                    start_index += 1
+                    continue
+            elif self.pine_signal_enabled and self.pine_signal_mode == "filter":
+                if pine_action and pine_action != "buy":
+                    start_index += 1
+                    continue
+
+            strategy_cfg = self._get_strategy_settings()
+            indicators_selected = [k for k, v in (strategy_cfg.get("indicators") or {}).items() if v]
+            use_strategy = bool(indicators_selected or strategy_cfg.get("replace_neural") or strategy_cfg.get("mode") == "super")
+
+            if use_strategy:
+                candles = self._fetch_strategy_candles(base_symbol)
+                allowed, _ = self._strategy_should_enter(base_symbol, buy_count, sell_count, candles)
+                if not allowed:
+                    start_index += 1
+                    continue
+            else:
+                # Default behavior: long must be >= 3 and short must be 0
+                if not (buy_count >= 3 and sell_count == 0):
+                    start_index += 1
+                    continue
 
 
 

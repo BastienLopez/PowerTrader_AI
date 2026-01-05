@@ -5,6 +5,10 @@ You can place all config in `.env` and just run `python pt_hub.py`.
 Testnet still needs keys; use `BINANCE_PAPER=true` to simulate trades without keys.
 Use `BINANCE_PAPER_TEST=true` to force a full paper trade cycle (entry/hold/dca/exit).
 
+## Run
+- UI: `python pt_hub.py`
+- Tests: `pytest -q`
+
 ## Exchange modes (Robinhood + Binance)
 
 PowerTrader can run with Robinhood (legacy) or Binance Spot. Use `.env` to select the provider and mode.

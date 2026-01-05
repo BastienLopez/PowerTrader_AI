@@ -47,8 +47,8 @@ def test_get_klines():
     )
     candles = client.get_klines("BTC", "1m", 2)
     assert candles == [
-        {"ts": 1700000000, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5},
-        {"ts": 1700000060, "open": 1.5, "high": 2.5, "low": 1.0, "close": 2.0},
+        {"ts": 1700000000, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100.0},
+        {"ts": 1700000060, "open": 1.5, "high": 2.5, "low": 1.0, "close": 2.0, "volume": 120.0},
     ]
 
 

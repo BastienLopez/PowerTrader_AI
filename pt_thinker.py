@@ -655,6 +655,19 @@ def step_coin(sym: str):
 		low_weight_list = file.read().replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
 		file.close()
 
+		# sanitize memory + weights (avoid empty entries)
+		memory_list = [m for m in memory_list if str(m).strip() != ""]
+		mem_len = len(memory_list)
+		if mem_len == 0:
+			memory_list = ["0{}0{}0"]
+			mem_len = 1
+		if len(weight_list) < mem_len:
+			weight_list += ['1.0'] * (mem_len - len(weight_list))
+		if len(high_weight_list) < mem_len:
+			high_weight_list += ['1.0'] * (mem_len - len(high_weight_list))
+		if len(low_weight_list) < mem_len:
+			low_weight_list += ['1.0'] * (mem_len - len(low_weight_list))
+
 		mem_ind = 0
 		diffs_list = []
 		any_perfect = 'no'
@@ -669,9 +682,38 @@ def step_coin(sym: str):
 		low_moves = []
 
 		while True:
-			memory_pattern = memory_list[mem_ind].split('{}')[0].replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
+			raw_pattern = memory_list[mem_ind].split('{}')[0].replace("'", "").replace(',', '').replace('"', '').replace(']', '').replace('[', '').split(' ')
+			memory_pattern = [p for p in raw_pattern if p]
+			if not memory_pattern:
+				diffs_list.append(100.0)
+				mem_ind += 1
+				if mem_ind >= len(memory_list):
+					if any_perfect == 'no':
+						final_moves = 0.0
+						high_final_moves = 0.0
+						low_final_moves = 0.0
+						del perfects[tf_choice_index]
+						perfects.insert(tf_choice_index, 'inactive')
+					else:
+						try:
+							final_moves = sum(moves) / len(moves)
+							high_final_moves = sum(high_moves) / len(high_moves)
+							low_final_moves = sum(low_moves) / len(low_moves)
+							del perfects[tf_choice_index]
+							perfects.insert(tf_choice_index, 'active')
+						except:
+							final_moves = 0.0
+							high_final_moves = 0.0
+							low_final_moves = 0.0
+							del perfects[tf_choice_index]
+							perfects.insert(tf_choice_index, 'inactive')
+					break
+				continue
 			check_dex = 0
-			memory_candle = float(memory_pattern[check_dex])
+			try:
+				memory_candle = float(memory_pattern[check_dex])
+			except:
+				memory_candle = 0.0
 
 			if current_candle == 0.0 and memory_candle == 0.0:
 				difference = 0.0

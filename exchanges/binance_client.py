@@ -375,7 +375,17 @@ class BinanceExchangeClient(ExchangeClient):
                 h = float(row[2])
                 l = float(row[3])
                 c = float(row[4])
-                candles.append({"ts": int(ts_ms / 1000), "open": o, "high": h, "low": l, "close": c})
+                v = float(row[5]) if len(row) > 5 else 0.0
+                candles.append(
+                    {
+                        "ts": int(ts_ms / 1000),
+                        "open": o,
+                        "high": h,
+                        "low": l,
+                        "close": c,
+                        "volume": v,
+                    }
+                )
             except Exception:
                 continue
         return candles
@@ -576,6 +586,20 @@ class BinancePaperExchangeClient(ExchangeClient):
         }
         self._orders: List[Dict[str, Any]] = []
         self._next_order_id = 1
+        fee_rate_env = os.environ.get("BINANCE_PAPER_FEE_RATE", "").strip()
+        self.taker_fee_rate = float(os.environ.get("BINANCE_TAKER_FEE_RATE", fee_rate_env or "0.001"))
+        self.maker_fee_rate = float(os.environ.get("BINANCE_MAKER_FEE_RATE", fee_rate_env or "0.001"))
+        self.slippage_pct = float(os.environ.get("BINANCE_PAPER_SLIPPAGE_PCT", "0.0") or 0.0)
+        self.partial_fill_enabled = _env_flag("BINANCE_PAPER_PARTIAL_FILL", False)
+        self.partial_fill_min = float(os.environ.get("BINANCE_PAPER_PARTIAL_FILL_MIN", "0.6") or 0.6)
+        self.partial_fill_max = float(os.environ.get("BINANCE_PAPER_PARTIAL_FILL_MAX", "1.0") or 1.0)
+
+    def _split_symbol(self, symbol_norm: str) -> Tuple[str, str]:
+        known_quotes = [self.default_quote, "USDT", "USDC", "BUSD", "BTC", "ETH", "BNB", "USD"]
+        for quote in known_quotes:
+            if symbol_norm.endswith(quote) and len(symbol_norm) > len(quote):
+                return symbol_norm[: -len(quote)], quote
+        return symbol_norm[: -len(self.default_quote)], self.default_quote
 
     def _get_balance(self, asset: str) -> Dict[str, Decimal]:
         asset = asset.strip().upper()
@@ -621,10 +645,27 @@ class BinancePaperExchangeClient(ExchangeClient):
         qty = Decimal(str(adj_qty))
 
         fill_price = Decimal(str(adj_price)) if adj_price is not None else Decimal(str(self.get_price(symbol_norm)))
-        notional = qty * fill_price
+        if self.slippage_pct > 0:
+            slip = Decimal(str(random.uniform(0.0, float(self.slippage_pct))))
+            if side == "BUY":
+                fill_price *= (Decimal("1") + slip)
+            else:
+                fill_price *= (Decimal("1") - slip)
 
-        base = symbol_norm[: -len(self.default_quote)]
-        quote = self.default_quote
+        filled_qty = qty
+        if self.partial_fill_enabled:
+            pf_min = max(0.01, min(self.partial_fill_min, self.partial_fill_max))
+            pf_max = max(pf_min, self.partial_fill_max)
+            filled_qty = qty * Decimal(str(random.uniform(pf_min, pf_max)))
+            filled_qty = max(Decimal("0"), min(qty, filled_qty))
+
+        notional = filled_qty * fill_price
+
+        base, quote = self._split_symbol(symbol_norm)
+        fee_rate = Decimal(str(self.taker_fee_rate if order_type == "MARKET" else self.maker_fee_rate))
+        fee = Decimal("0")
+        fee_asset = ""
+        executed_qty = filled_qty
 
         if side == "BUY":
             quote_bal = self._get_balance(quote)
@@ -632,14 +673,21 @@ class BinancePaperExchangeClient(ExchangeClient):
                 raise ValueError(f"Insufficient {quote} balance for paper buy.")
             quote_bal["free"] -= notional
             base_bal = self._get_balance(base)
-            base_bal["free"] += qty
+            fee = (filled_qty * fee_rate)
+            executed_qty = filled_qty - fee
+            if executed_qty < 0:
+                executed_qty = Decimal("0")
+            base_bal["free"] += executed_qty
+            fee_asset = base
         elif side == "SELL":
             base_bal = self._get_balance(base)
-            if base_bal["free"] < qty:
+            if base_bal["free"] < filled_qty:
                 raise ValueError(f"Insufficient {base} balance for paper sell.")
-            base_bal["free"] -= qty
+            base_bal["free"] -= filled_qty
             quote_bal = self._get_balance(quote)
-            quote_bal["free"] += notional
+            fee = (notional * fee_rate)
+            quote_bal["free"] += (notional - fee)
+            fee_asset = quote
         else:
             raise ValueError("Order side must be BUY or SELL.")
 
@@ -649,11 +697,13 @@ class BinancePaperExchangeClient(ExchangeClient):
             "symbol": symbol_norm,
             "side": side,
             "type": order_type,
-            "status": "FILLED",
+            "status": "FILLED" if filled_qty == qty else "PARTIALLY_FILLED",
             "price": _format_decimal(fill_price),
             "origQty": _format_decimal(qty),
-            "executedQty": _format_decimal(qty),
+            "executedQty": _format_decimal(executed_qty),
             "cummulativeQuoteQty": _format_decimal(notional),
+            "fee": _format_decimal(fee),
+            "feeAsset": fee_asset,
             "time": int(time.time() * 1000),
         }
         self._record_order(order)
